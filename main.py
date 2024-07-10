@@ -1,13 +1,13 @@
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import declarative_base, sessionmaker
 from sqlalchemy.future import select
 from sqlalchemy import Column, Integer, String, LargeBinary
-import os
+import io
 
-DATABASE_URL = "your database"
+DATABASE_URL = "postgresql+asyncpg://user:password@localhost/mydatabase"
 engine = create_async_engine(DATABASE_URL, echo=True)
 SessionLocal = sessionmaker(bind=engine, class_=AsyncSession, expire_on_commit=False)
 Base = declarative_base()
@@ -29,14 +29,20 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
-@app.post("/upload/")
+@app.post("/upload")
 async def upload_file(file: UploadFile = File(...)):
-    async with SessionLocal() as session:
+    try:
         content = await file.read()
         file_model = FileModel(filename=file.filename, content=content)
-        session.add(file_model)
-        await session.commit()
-    return {"Successfully uploaded": file.filename}
+        async with SessionLocal() as session:
+            session.add(file_model)
+            await session.commit()
+
+        return {"Successfully uploaded": file.filename}
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to upload file: {str(e)}")
+
 
 @app.get("/retrieve/{filename}")
 async def read_file(filename: str):
@@ -45,25 +51,19 @@ async def read_file(filename: str):
         file_model = result.scalars().first()
         if file_model is None:
             raise HTTPException(status_code=404, detail="File not found")
-        
-        temp_file_path = f"/tmp/{file_model.filename}"
-        try:
-            with open(temp_file_path, 'wb') as temp_file:
-                temp_file.write(file_model.content)
-            
-            print(f"media_type=application/octet-stream")
-            print(f"Content-Disposition=attachment; filename={file_model.filename}")
-            print(f"content={file_model.content.decode('utf-8', errors='ignore')}")
-            
-            return FileResponse(path=temp_file_path, filename=file_model.filename, media_type="application/octet-stream")
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Error processing file: {str(e)}")
-        finally:
-            
-            if os.path.exists(temp_file_path):
-                os.remove(temp_file_path)
+        print(f"Retrieved file: {file_model.filename} with size: {len(file_model.content)} bytes")
+        if not file_model.content:
+            raise HTTPException(status_code=500, detail="File content is empty")
 
-@app.get("/files/")
+        file_like = io.BytesIO(file_model.content)
+        response = StreamingResponse(file_like, media_type="application/octet-stream")
+        response.headers["Content-Disposition"] = f"attachment; filename={file_model.filename}"
+        
+        print(f"Response headers: {response.headers}")
+        return response
+
+
+@app.get("/files")
 async def list_files():
     async with SessionLocal() as session:
         result = await session.execute(select(FileModel))
@@ -81,7 +81,6 @@ async def delete_file(filename: str):
             await session.delete(file_model)
         await session.commit()
     return {"Message": f"Deleted all occurrences of {filename}"}
-
 
 if __name__ == "__main__":
     import uvicorn
